@@ -2,6 +2,7 @@
 
 import hashlib
 import logging
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -103,7 +104,20 @@ def _scoped_crumbs(crumbs, host: str, prefix: str):
     return [crumb for crumb in crumbs if crumb.url and crumb.name and in_scope(crumb.url, host, prefix)]
 
 
-def execute_crawl(run_id: int, settings: Settings | None = None) -> None:
+def _mark_stopped(run, session) -> None:
+    if run.status != "running":
+        return
+    run.status = "stopped"
+    run.error_message = "Stopped"
+    run.finished_at = utcnow()
+    session.commit()
+
+
+def execute_crawl(
+    run_id: int,
+    settings: Settings | None = None,
+    cancel: threading.Event | None = None,
+) -> None:
     settings = settings or get_settings()
     init_db(settings)
     session = get_session_factory(settings)()
@@ -171,6 +185,9 @@ def execute_crawl(run_id: int, settings: Settings | None = None) -> None:
             _listen(page, bucket)
 
             while queue and run.pages_fetched < run.max_pages:
+                if cancel is not None and cancel.is_set():
+                    _mark_stopped(run, session)
+                    return
                 task = queue.popleft()
                 scheduled.discard(task.url)
                 if task.url in visited:
@@ -277,7 +294,11 @@ def execute_crawl(run_id: int, settings: Settings | None = None) -> None:
                     run.products_upserted,
                     len(queue),
                 )
-                time.sleep(delay)
+                if cancel is not None and cancel.wait(delay):
+                    _mark_stopped(run, session)
+                    return
+                if cancel is None and delay:
+                    time.sleep(delay)
 
         if run.status == "running":
             run.status = "completed"
@@ -291,6 +312,7 @@ def execute_crawl(run_id: int, settings: Settings | None = None) -> None:
                 run.categories_upserted,
             )
     except Exception as exc:
+        stopped = cancel is not None and cancel.is_set()
         logger.exception("Crawl %s failed", run_id)
         try:
             session.rollback()
@@ -298,14 +320,15 @@ def execute_crawl(run_id: int, settings: Settings | None = None) -> None:
             pass
         try:
             failed = session.get(CrawlRun, run_id)
-            if failed is not None and failed.status != "completed":
-                failed.status = "failed"
-                failed.error_message = str(exc)[:500]
+            if failed is not None and failed.status not in ("completed", "stopped"):
+                failed.status = "stopped" if stopped else "failed"
+                failed.error_message = "Stopped" if stopped else str(exc)[:500]
                 failed.finished_at = utcnow()
                 session.commit()
         except Exception:
             logger.exception("Could not record the crawl failure")
-        raise
+        if not stopped:
+            raise
     finally:
         if browser is not None:
             try:

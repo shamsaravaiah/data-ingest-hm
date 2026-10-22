@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Catalog ingest</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f4f1ea;
+      --card: #fffdf8;
+      --ink: #1c1915;
+      --muted: #6d655c;
+      --line: #e4ddd2;
+      --accent: #0f6e56;
+      --accent-ink: #ffffff;
+      --running: #9a6700;
+      --completed: #0f6e56;
+      --stopped: #8f3d2b;
+      --failed: #8f3d2b;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font: 16px/1.45 "Iowan Old Style", Palatino, Georgia, serif;
+      background: var(--bg);
+      color: var(--ink);
+    }
+    main {
+      max-width: 640px;
+      margin: 0 auto;
+      padding: 48px 20px 64px;
+    }
+    h1 {
+      font-size: 32px;
+      font-weight: 600;
+      letter-spacing: -0.03em;
+      margin: 0 0 8px;
+    }
+    p.lead {
+      margin: 0 0 28px;
+      color: var(--muted);
+    }
+    form, section {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 20px;
+    }
+    label {
+      display: block;
+      font-size: 13px;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 8px;
+    }
+    input {
+      width: 100%;
+      font: inherit;
+      padding: 12px 14px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #fff;
+      color: var(--ink);
+    }
+    .row {
+      display: flex;
+      gap: 12px;
+      margin-top: 14px;
+    }
+    .row input[type="number"] { max-width: 140px; }
+    button {
+      font: inherit;
+      border: 0;
+      border-radius: 10px;
+      padding: 12px 18px;
+      cursor: pointer;
+    }
+    button.primary { background: var(--accent); color: var(--accent-ink); }
+    button.quiet { background: transparent; color: var(--ink); border: 1px solid var(--line); }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+    section { margin-top: 18px; }
+    .status-line {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+    }
+    .pill {
+      display: inline-block;
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-size: 13px;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      background: var(--line);
+    }
+    .pill.running { background: #f3e2b8; color: var(--running); }
+    .pill.completed { background: #d7efe6; color: var(--completed); }
+    .pill.stopped, .pill.failed, .pill.stopping { background: #f6ddd6; color: var(--stopped); }
+    .bar {
+      margin-top: 14px;
+      height: 10px;
+      border-radius: 999px;
+      background: #efeae2;
+      overflow: hidden;
+    }
+    .bar > div {
+      height: 100%;
+      width: 0%;
+      background: var(--accent);
+      transition: width 0.3s ease;
+    }
+    dl {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 6px 16px;
+      margin: 16px 0 0;
+    }
+    dt { color: var(--muted); }
+    dd { margin: 0; }
+    .error { color: var(--stopped); margin-top: 12px; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Catalog ingest</h1>
+    <p class="lead">Each base URL is stored as its own site. H&amp;M and Zara do not share products.</p>
+    <form id="form">
+      <label for="url">Base URL</label>
+      <input id="url" name="url" type="url" required placeholder="https://www2.hm.com/en_us" value="https://www2.hm.com/en_us" />
+      <div class="row">
+        <input id="max" name="max_pages" type="number" min="1" max="200000" value="200" aria-label="Max pages" />
+        <button class="primary" id="ingest" type="submit">Ingest</button>
+        <button class="quiet" id="stop" type="button" disabled>Stop</button>
+      </div>
+    </form>
+    <section>
+      <div class="status-line">
+        <strong id="title">No crawl yet</strong>
+        <span class="pill" id="pill">idle</span>
+      </div>
+      <div class="bar" aria-hidden="true"><div id="fill"></div></div>
+      <dl>
+        <dt>Vendor</dt><dd id="vendor">—</dd>
+        <dt>Pages</dt><dd id="pages">—</dd>
+        <dt>Products</dt><dd id="products">—</dd>
+        <dt>Categories</dt><dd id="categories">—</dd>
+      </dl>
+      <p class="error" id="error" hidden></p>
+    </section>
+  </main>
+  <script>
+    const form = document.querySelector("#form");
+    const ingest = document.querySelector("#ingest");
+    const stop = document.querySelector("#stop");
+    const pill = document.querySelector("#pill");
+    const fill = document.querySelector("#fill");
+    const title = document.querySelector("#title");
+    const vendor = document.querySelector("#vendor");
+    const pages = document.querySelector("#pages");
+    const products = document.querySelector("#products");
+    const categories = document.querySelector("#categories");
+    const error = document.querySelector("#error");
+    let runId = null;
+    let timer = null;
+    let stopping = false;
+
+    function setPill(status) {
+      pill.textContent = status;
+      pill.className = "pill " + status;
+    }
+
+    function render(run) {
+      const status = stopping && run.status === "running" ? "stopping" : run.status;
+      setPill(status);
+      title.textContent = run.start_url || "Crawl " + run.id;
+      const prefix = run.locale_prefix || "";
+      vendor.textContent = (run.host || "—") + prefix;
+      pages.textContent = run.pages_fetched + " / " + run.max_pages;
+      products.textContent = String(run.products_upserted);
+      categories.textContent = String(run.categories_upserted);
+      const pct = run.max_pages ? Math.min(100, Math.round((run.pages_fetched / run.max_pages) * 100)) : 0;
+      fill.style.width = (status === "completed" ? 100 : pct) + "%";
+      if (run.error_message && status !== "running" && status !== "stopping") {
+        error.hidden = false;
+        error.textContent = run.error_message;
+      } else {
+        error.hidden = true;
+      }
+      const active = status === "running" || status === "stopping";
+      ingest.disabled = active;
+      stop.disabled = !active;
+      if (!active) stopping = false;
+    }
+
+    async function poll() {
+      if (!runId) return;
+      const response = await fetch("/v1/crawls/" + runId);
+      if (!response.ok) return;
+      const run = await response.json();
+      render(run);
+      if (run.status === "running") return;
+      clearInterval(timer);
+      timer = null;
+    }
+
+    function watch() {
+      if (timer) clearInterval(timer);
+      timer = setInterval(poll, 2000);
+      poll();
+    }
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      error.hidden = true;
+      ingest.disabled = true;
+      const body = {
+        url: document.querySelector("#url").value.trim(),
+        max_pages: Number(document.querySelector("#max").value || 200)
+      };
+      const response = await fetch("/v1/crawls", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        ingest.disabled = false;
+        error.hidden = false;
+        error.textContent = payload.detail || "Could not start the crawl";
+        return;
+      }
+      runId = payload.id;
+      stopping = false;
+      setPill("running");
+      watch();
+    });
+
+    stop.addEventListener("click", async () => {
+      if (!runId) return;
+      stopping = true;
+      setPill("stopping");
+      stop.disabled = true;
+      const response = await fetch("/v1/crawls/" + runId + "/stop", { method: "POST" });
+      if (!response.ok) {
+        stopping = false;
+        const payload = await response.json().catch(() => ({}));
+        error.hidden = false;
+        error.textContent = payload.detail || "Could not stop the crawl";
+      }
+      poll();
+    });
+  </script>
+</body>
+</html>

@@ -4,8 +4,10 @@ import logging
 import threading
 from contextlib import asynccontextmanager
 from decimal import Decimal
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select, text
 from sqlalchemy.orm import selectinload
@@ -18,7 +20,8 @@ from ingest.storage.repository import mark_interrupted
 
 logger = logging.getLogger(__name__)
 _lock = threading.Lock()
-_state = {"running": False}
+_state: dict = {"running": False, "run_id": None, "cancel": None}
+_PAGE = Path(__file__).resolve().parent / "static" / "index.html"
 
 
 @asynccontextmanager
@@ -50,11 +53,12 @@ def _iso(value) -> str | None:
     return value.isoformat()
 
 
-def _run_payload(run: CrawlRun, host: str) -> dict:
+def _run_payload(run: CrawlRun, host: str, locale_prefix: str = "") -> dict:
     return {
         "id": run.id,
         "status": run.status,
         "host": host,
+        "locale_prefix": locale_prefix,
         "start_url": run.start_url,
         "max_pages": run.max_pages,
         "pages_fetched": run.pages_fetched,
@@ -176,14 +180,25 @@ def _product_payload(product: Product) -> dict:
     }
 
 
-def _worker(run_id: int) -> None:
+def _clear_running() -> None:
+    _state["running"] = False
+    _state["run_id"] = None
+    _state["cancel"] = None
+
+
+def _worker(run_id: int, cancel: threading.Event) -> None:
     try:
-        execute_crawl(run_id, get_settings())
+        execute_crawl(run_id, get_settings(), cancel)
     except Exception:
         logger.exception("Background crawl %s failed", run_id)
     finally:
         with _lock:
-            _state["running"] = False
+            _clear_running()
+
+
+@app.get("/")
+def index() -> FileResponse:
+    return FileResponse(_PAGE)
 
 
 @app.get("/health")
@@ -195,22 +210,38 @@ def health() -> dict:
 
 @app.post("/v1/crawls", status_code=202)
 def create_crawl(body: CrawlIn) -> dict:
+    cancel = threading.Event()
     with _lock:
         if _state["running"]:
             raise HTTPException(status_code=409, detail="A crawl is already running")
         _state["running"] = True
+        _state["cancel"] = cancel
     try:
         run_id = start_crawl(body.url, body.max_pages, get_settings())
     except ValueError as exc:
         with _lock:
-            _state["running"] = False
+            _clear_running()
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception:
         with _lock:
-            _state["running"] = False
+            _clear_running()
         raise
-    threading.Thread(target=_worker, args=(run_id,), daemon=True).start()
+    with _lock:
+        _state["run_id"] = run_id
+    threading.Thread(target=_worker, args=(run_id, cancel), daemon=True).start()
     return {"id": run_id, "status": "running"}
+
+
+@app.post("/v1/crawls/{run_id}/stop")
+def stop_crawl(run_id: int) -> dict:
+    with _lock:
+        cancel = _state.get("cancel")
+        active = _state.get("run_id") == run_id and _state.get("running") and cancel is not None
+        if active:
+            cancel.set()
+    if not active:
+        raise HTTPException(status_code=409, detail="This crawl is not running")
+    return {"id": run_id, "status": "stopping"}
 
 
 @app.get("/v1/crawls/{run_id}")
@@ -220,7 +251,11 @@ def get_crawl(run_id: int) -> dict:
         if run is None:
             raise HTTPException(status_code=404, detail="Crawl not found")
         site = session.get(Site, run.site_id)
-        return _run_payload(run, site.host if site else "")
+        return _run_payload(
+            run,
+            site.host if site else "",
+            site.locale_prefix if site else "",
+        )
 
 
 @app.get("/v1/sites/{host}/categories")
